@@ -67,6 +67,10 @@ must be re-granted after each rebuild. A self-signed identity
 
 - External monitor must support DDC/CI over its connection (USB-C/DP on
   Apple Silicon; built-in HDMI on M1 does not pass DDC).
+- Some monitors accept DDC contrast writes but silently ignore luminance
+  writes (often due to a dynamic-contrast/eco picture mode). Auto-sync and
+  movie mode require a monitor that accepts luminance writes; the gamma
+  slider works regardless. Run `bin/luminos --test` to probe your display.
 - Sync has ~1–2 s latency by design (polling + hysteresis) to avoid spamming
   the monitor's I²C bus.
 - Gamma is a GPU color-table adjustment: it resets on display sleep, reconnect,

@@ -298,7 +298,23 @@ var gTap: CFMachPort?
 
 if CommandLine.arguments.contains("--test") {
     print("luminance:", DDC.getLuminance() ?? -1)
+    print("contrast:", DDC.getContrast() ?? -1)
     print("builtin:", sync.builtin.value() ?? -1)
+    // probe whether the monitor honors DDC luminance writes
+    if let orig = DDC.getLuminance(), (0...100).contains(orig) {
+        let probe = orig >= 90 ? orig - 10 : orig + 10
+        DDC.setLuminance(probe)
+        Thread.sleep(forTimeInterval: 1.5)
+        let after = DDC.getLuminance()
+        DDC.setLuminance(orig)  // restore
+        if after == probe {
+            print("ddc-write: ok (luminance writes accepted)")
+        } else {
+            print("ddc-write: REJECTED (monitor ignores luminance writes; read back \(after ?? -1), expected \(probe))")
+        }
+    } else {
+        print("ddc-write: skipped (no valid luminance read)")
+    }
     exit(0)
 }
 
