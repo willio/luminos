@@ -49,9 +49,16 @@ Tunables at the top of `Sources/luminos/main.swift`:
 ## Rebuilding
 
 ```sh
-swift build -c release && cp .build/release/luminos bin/luminos
-launchctl kickstart -k gui/$(id -u)/dev.luminos.daemon
+swift build -c release
+launchctl bootout gui/$(id -u)/dev.luminos.daemon
+rm -f bin/luminos && cp .build/release/luminos bin/luminos   # new inode, see below
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.luminos.daemon.plist
 ```
+
+**Important**: replace `bin/luminos` with `rm` + `cp`, never `cp` in place.
+macOS tracks the running binary by inode (code-signature provenance);
+overwriting the file in place invalidates the signature tracking and the
+kernel SIGKILLs any future launch with "Taskgated Invalid Signature".
 
 Note: the binary is ad-hoc signed; if you ever enable the CGEvent tap code path
 (media-key interception), macOS Accessibility grants bind to the build hash and
