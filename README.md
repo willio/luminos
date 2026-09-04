@@ -16,15 +16,23 @@ Closes the gap where macOS only adjusts the built-in display's brightness.
 
 ## Usage
 
+Luminos is a menu-bar app (`LSUIElement` agent, no Dock icon). It installs to
+`~/Applications/Luminos.app` and starts at login via LaunchAgent.
+
 ```sh
-bin/luminos --sync    # daemon mode (managed by launchd, see below)
-bin/luminos --movie   # toggle movie mode on the external monitor
-bin/luminos --test    # print external luminance + built-in brightness
+# CLI (works while the app is running)
+~/Applications/Luminos.app/Contents/MacOS/Luminos --movie   # toggle movie mode
+~/Applications/Luminos.app/Contents/MacOS/Luminos --test    # diagnostics + DDC write probe
 ```
 
-Log: `/tmp/luminos.log`
+Log: `/tmp/luminos.log` (launchd stdout) and the unified log
+(`log show --predicate 'process == "Luminos"' --last 10m`).
 
 ## Install / autostart
+
+```sh
+./build.sh    # build → bundle → ad-hoc sign → deploy to ~/Applications → (re)start
+```
 
 LaunchAgent: `~/Library/LaunchAgents/dev.luminos.daemon.plist`
 (starts at login, KeepAlive with 30 s throttle)
@@ -48,17 +56,13 @@ Tunables at the top of `Sources/luminos/main.swift`:
 
 ## Rebuilding
 
-```sh
-swift build -c release
-launchctl bootout gui/$(id -u)/dev.luminos.daemon
-rm -f bin/luminos && cp .build/release/luminos bin/luminos   # new inode, see below
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.luminos.daemon.plist
-```
+Just run `./build.sh` — it builds, bundles, signs, stops the daemon, replaces
+the app and restarts it in one go.
 
-**Important**: replace `bin/luminos` with `rm` + `cp`, never `cp` in place.
-macOS tracks the running binary by inode (code-signature provenance);
-overwriting the file in place invalidates the signature tracking and the
-kernel SIGKILLs any future launch with "Taskgated Invalid Signature".
+**Important**: the script replaces `Luminos.app` with `rm -rf` + `cp -R` (new
+inode). Never overwrite the app in place — macOS tracks the running binary by
+inode (code-signature provenance); overwriting it makes the kernel SIGKILL
+future launches with "Taskgated Invalid Signature".
 
 Note: the binary is ad-hoc signed; if you ever enable the CGEvent tap code path
 (media-key interception), macOS Accessibility grants bind to the build hash and
