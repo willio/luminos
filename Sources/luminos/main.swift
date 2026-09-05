@@ -221,30 +221,28 @@ enum Gamma {
 
 final class StatusBar: NSObject {
     let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-    let slider = NSSlider(value: 1.0, minValue: 0.5, maxValue: 3.5, target: nil, action: nil)
     let syncItem = NSMenuItem(title: "Sync with built-in display", action: #selector(toggleSync), keyEquivalent: "")
     let movieItem = NSMenuItem(title: "Movie Mode (backlight boost)", action: #selector(toggleMovie), keyEquivalent: "")
-    let gammaLabel = NSMenuItem(title: "Gamma (drag to adjust)", action: nil, keyEquivalent: "")
+    private var gammaValue: NSTextField!
+    private var slider: NSSlider!
+    private var presetButtons: [(NSButton, Float)] = []
 
     override init() {
         super.init()
         if let btn = item.button {
-            btn.image = NSImage(systemSymbolName: "display", accessibilityDescription: "Luminos")
+            if let path = Bundle.main.path(forResource: "StatusIcon", ofType: "png"),
+               let img = NSImage(contentsOfFile: path) {
+                img.isTemplate = true
+                btn.image = img
+            } else {
+                btn.image = NSImage(systemSymbolName: "display", accessibilityDescription: "Luminos")
+            }
         }
-        slider.frame = NSRect(x: 0, y: 0, width: 220, height: 28)
-        slider.target = self
-        slider.action = #selector(sliderChanged)
-        slider.isContinuous = true
 
         let menu = NSMenu()
-        gammaLabel.isEnabled = false
-        menu.addItem(gammaLabel)
-        let sliderItem = NSMenuItem()
-        sliderItem.view = slider
-        menu.addItem(sliderItem)
-        let resetItem = NSMenuItem(title: "Reset Gamma", action: #selector(resetGamma), keyEquivalent: "")
-        resetItem.target = self
-        menu.addItem(resetItem)
+        menu.addItem(makeHeaderItem())
+        menu.addItem(.separator())
+        menu.addItem(makeGammaItem())
         menu.addItem(.separator())
         syncItem.target = self
         syncItem.state = sync.enabled ? .on : .off
@@ -259,17 +257,70 @@ final class StatusBar: NSObject {
         item.menu = menu
     }
 
-    @objc func sliderChanged() {
-        let g = Float(slider.doubleValue)
-        Gamma.set(g)
-        gammaLabel.title = String(format: "Gamma: %.2f (drag to adjust)", g)
+    private func label(_ text: String, _ size: CGFloat, _ color: NSColor, bold: Bool = false) -> NSTextField {
+        let f = NSTextField(labelWithString: text)
+        f.font = bold ? .boldSystemFont(ofSize: size) : .systemFont(ofSize: size)
+        f.textColor = color
+        return f
     }
 
-    @objc func resetGamma() {
-        Gamma.reset()
-        slider.doubleValue = 1.0
-        gammaLabel.title = "Gamma: 1.00 (drag to adjust)"
+    private func makeHeaderItem() -> NSMenuItem {
+        let v = NSView(frame: NSRect(x: 0, y: 0, width: 250, height: 44))
+        let title = label("Luminos", 14, .labelColor, bold: true)
+        title.frame = NSRect(x: 16, y: 16, width: 200, height: 20)
+        let sub = label("Mi Monitor", 10, .secondaryLabelColor)
+        sub.frame = NSRect(x: 16, y: 2, width: 200, height: 14)
+        v.addSubview(title); v.addSubview(sub)
+        let item = NSMenuItem()
+        item.view = v
+        return item
     }
+
+    private func makeGammaItem() -> NSMenuItem {
+        let w: CGFloat = 250
+        let v = NSView(frame: NSRect(x: 0, y: 0, width: w, height: 108))
+
+        let head = label("GAMMA", 9, .secondaryLabelColor, bold: true)
+        head.frame = NSRect(x: 16, y: 88, width: 120, height: 12)
+        v.addSubview(head)
+
+        gammaValue = label("1.00", 13, NSColor(calibratedRed: 1.0, green: 0.82, blue: 0.35, alpha: 1), bold: true)
+        gammaValue.alignment = .right
+        gammaValue.frame = NSRect(x: w - 66, y: 84, width: 50, height: 18)
+        v.addSubview(gammaValue)
+
+        slider = NSSlider(value: 1.0, minValue: 0.5, maxValue: 3.5, target: self, action: #selector(sliderChanged))
+        slider.isContinuous = true
+        slider.frame = NSRect(x: 16, y: 56, width: w - 32, height: 24)
+        v.addSubview(slider)
+
+        let presets: [(String, Float)] = [("Reset", 1.0), ("1.3", 1.3), ("1.6", 1.6), ("2.2", 2.2)]
+        var px: CGFloat = 16
+        for (title, val) in presets {
+            let b = NSButton(title: title, target: self, action: #selector(presetTapped(_:)))
+            b.bezelStyle = .inline
+            b.controlSize = .small
+            b.tag = presetButtons.count
+            b.frame = NSRect(x: px, y: 18, width: 52, height: 26)
+            presetButtons.append((b, val))
+            v.addSubview(b)
+            px += 56
+        }
+
+        let item = NSMenuItem()
+        item.view = v
+        return item
+    }
+
+    private func applyGamma(_ g: Float) {
+        Gamma.set(g)
+        slider.doubleValue = Double(g)
+        gammaValue.stringValue = String(format: "%.2f", g)
+    }
+
+    @objc func sliderChanged() { applyGamma(Float(slider.doubleValue)) }
+
+    @objc func presetTapped(_ sender: NSButton) { applyGamma(presetButtons[sender.tag].1) }
 
     @objc func toggleSync() {
         sync.enabled.toggle()
@@ -287,7 +338,7 @@ extension StatusBar: NSMenuDelegate {
     func menuWillOpen(_ menu: NSMenu) {
         let g = Gamma.get()
         slider.doubleValue = Double(g)
-        gammaLabel.title = String(format: "Gamma: %.2f (drag to adjust)", g)
+        gammaValue.stringValue = String(format: "%.2f", g)
         movieItem.state = movieMode.isOn ? .on : .off
     }
 }

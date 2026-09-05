@@ -17,6 +17,7 @@ mkdir -p ".build/$APP_NAME.app/Contents/MacOS" ".build/$APP_NAME.app/Contents/Re
 cp .build/release/luminos ".build/$APP_NAME.app/Contents/MacOS/$APP_NAME"
 cp Resources/Info.plist ".build/$APP_NAME.app/Contents/Info.plist"
 cp Resources/AppIcon.icns ".build/$APP_NAME.app/Contents/Resources/AppIcon.icns"
+cp Resources/StatusIcon*.png ".build/$APP_NAME.app/Contents/Resources/" 2>/dev/null || true
 
 echo "▸ sign (ad-hoc)"
 codesign --force --sign - ".build/$APP_NAME.app"
