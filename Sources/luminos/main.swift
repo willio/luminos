@@ -243,6 +243,14 @@ final class CapsuleSliderCell: NSSliderCell {
         let filled = NSRect(x: r.minX, y: r.minY, width: knobRect(flipped: flipped).midX - r.minX, height: r.height)
         NSColor(calibratedWhite: 1.0, alpha: 0.22).setFill()
         filled.fill()
+        // tick notches at the labeled scale points
+        NSColor.tertiaryLabelColor.setFill()
+        for t: Float in [0.8, 1.2, 1.6, 2.0, 2.4] {
+            let frac = CGFloat((t - GAMMA_MIN) / (GAMMA_MAX - GAMMA_MIN))
+            let x = r.minX + frac * r.width
+            NSBezierPath(roundedRect: NSRect(x: x - 0.75, y: r.maxY - 7, width: 1.5, height: 5),
+                         xRadius: 0.75, yRadius: 0.75).fill()
+        }
         NSGraphicsContext.current?.restoreGraphicsState()
     }
 
@@ -489,10 +497,15 @@ final class StatusBar: NSObject {
         setHero(1.0)
         v.addSubview(heroValue)
 
-        slider = GammaSlider(value: 1.0, minValue: Double(GAMMA_MIN), maxValue: Double(GAMMA_MAX),
-                             target: self, action: #selector(sliderChanged))
+        slider = GammaSlider()
         slider.cell = CapsuleSliderCell()
-        slider.cell?.controlSize = .regular
+        // configure range AFTER swapping the cell — a fresh cell defaults to 0...1,
+        // which pins every gamma value ≥ 1 to the far right
+        slider.minValue = Double(GAMMA_MIN)
+        slider.maxValue = Double(GAMMA_MAX)
+        slider.doubleValue = 1.0
+        slider.target = self
+        slider.action = #selector(sliderChanged)
         slider.isContinuous = true
         slider.frame = NSRect(x: 16, y: 50, width: w - 32, height: 32)
         v.addSubview(slider)
@@ -645,6 +658,7 @@ Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { _ in sync.tick(movi
 // Status bar (accessory policy = no Dock icon)
 let app = NSApplication.shared
 app.setActivationPolicy(.accessory)
+
 let statusBar = StatusBar()
 _ = statusBar
 
