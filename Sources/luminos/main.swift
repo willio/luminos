@@ -295,21 +295,26 @@ final class PresetCapsule: NSView {
 
         let bw = frame.width / CGFloat(values.count)
         for (i, v) in values.enumerated() {
-            let b = NSButton(title: v.0, target: self, action: #selector(tapped(_:)))
+            let b = NSButton(title: "", target: self, action: #selector(tapped(_:)))
             b.isBordered = false
             b.frame = NSRect(x: bw * CGFloat(i), y: 0, width: bw, height: frame.height)
-            b.font = .systemFont(ofSize: 13, weight: .medium)
             b.tag = i
-            (b.cell as? NSButtonCell)?.backgroundColor = .clear
-            b.contentTintColor = .secondaryLabelColor
             addSubview(b)
             buttons.append(b)
         }
+        highlight(-1) // set initial title colors
     }
     required init?(coder: NSCoder) { fatalError() }
 
     @objc private func tapped(_ sender: NSButton) {
         onSelect(values[sender.tag].1)
+    }
+
+    private func titleAttributes(active: Bool) -> [NSAttributedString.Key: Any] {
+        [
+            .font: NSFont.systemFont(ofSize: 13, weight: active ? .semibold : .medium),
+            .foregroundColor: active ? NSColor.labelColor : NSColor.secondaryLabelColor,
+        ]
     }
 
     /// Move the highlight pill to the preset matching `g`, or hide it.
@@ -320,12 +325,12 @@ final class PresetCapsule: NSView {
         if let i = idx {
             pill.isHidden = false
             pill.frame = NSRect(x: bw * CGFloat(i) + 4, y: 4, width: bw - 8, height: frame.height - 8)
-            for (j, b) in buttons.enumerated() {
-                b.contentTintColor = j == i ? .labelColor : .secondaryLabelColor
-            }
         } else {
             pill.isHidden = true
-            for b in buttons { b.contentTintColor = .secondaryLabelColor }
+        }
+        for (j, b) in buttons.enumerated() {
+            b.attributedTitle = NSAttributedString(string: values[j].0,
+                                                   attributes: titleAttributes(active: j == idx))
         }
     }
 }

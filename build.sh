@@ -24,13 +24,20 @@ codesign --force --sign - ".build/$APP_NAME.app"
 
 echo "▸ deploy"
 launchctl bootout "gui/$(id -u)/$BUNDLE_ID" 2>/dev/null || true
+pkill -f "$APP_PATH/Contents/MacOS/$APP_NAME" 2>/dev/null || true
+# wait until the old process is fully gone before replacing the bundle —
+# otherwise launchd can relaunch mid-copy → "Taskgated Invalid Signature"
+for _ in {1..20}; do
+    pgrep -f "$APP_PATH/Contents/MacOS/$APP_NAME" >/dev/null || break
+    sleep 0.25
+done
 mkdir -p "$INSTALL_DIR"
 # rm+cp (new inode): in-place overwrite breaks macOS signature provenance
 rm -rf "$APP_PATH"
 cp -R ".build/$APP_NAME.app" "$APP_PATH"
 
 PLIST="$HOME/Library/LaunchAgents/$BUNDLE_ID.plist"
-sed -i '' "s|<string>.*luminos.*</string>|<string>$APP_PATH/Contents/MacOS/$APP_NAME</string>|" "$PLIST" 2>/dev/null || true
+# (no sed: the plist is static; an over-broad sed once mangled Label and log paths)
 
 launchctl bootstrap "gui/$(id -u)" "$PLIST"
 sleep 2
