@@ -1,13 +1,16 @@
 //
 //  luminos — DDC brightness companion for external monitors on Apple Silicon
 //
-//  - F14/F15 (system brightness keys): pass through, mirror ±STEP to the
-//    external monitor via DDC (m1ddc).
-//  - F17: toggle "movie mode" (hardware backlight boost, restores on off).
+//  - Menu bar app: gamma slider (magnetic snaps + haptics) for dark movies,
+//    sync toggle to mirror built-in brightness to the external monitor,
+//    movie mode (hardware backlight boost).
 //  - --sync: keep the external monitor mapped to the built-in display's
 //    brightness (polls once per second).
+//  - --movie: toggle movie mode in the running daemon.
+//  - --test: DDC read/write probe.
 //
-//  Requires: Accessibility permission (for the CGEvent tap), m1ddc installed.
+//  Requires: m1ddc installed. (Key interception was dropped: TCC binds to
+//  the ad-hoc cdhash, so Accessibility grants break on every rebuild.)
 //
 
 import Cocoa
@@ -16,14 +19,43 @@ import Cocoa
 
 let M1DDC = "/opt/homebrew/bin/m1ddc"
 let DISPLAY_ARG = "2"              // m1ddc display index of the external monitor
-let STEP = 8                       // DDC luminance step per key press
 let SYNC_MIN = 10                  // DDC luminance floor when syncing
 let SYNC_MAX = 100
 let SYNC_HYSTERESIS = 2            // ignore built-in changes smaller than this (mapped units)
 let MOVIE_LUMINANCE = 100          // movie mode targets
 let MOVIE_CONTRAST = 85
 
-let KEYCODE_F17: Int64 = 64        // regular key event keycodes
+let GAMMA_MIN: Float = 0.8
+let GAMMA_MAX: Float = 2.4
+let GAMMA_SNAPS: [Float] = [1.0, 1.3, 1.6, 2.2]
+let GAMMA_SNAP_THRESHOLD: Float = 0.05
+
+// MARK: - Palette
+
+enum Palette {
+    /// Gold accent in dark mode, plain label in light (per design).
+    static let hero = NSColor(name: nil) { appearance in
+        if appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua {
+            return NSColor(calibratedRed: 1.0, green: 0.80, blue: 0.35, alpha: 1)
+        }
+        return NSColor.labelColor
+    }
+    static let track = NSColor(name: nil) { appearance in
+        appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+            ? NSColor(calibratedWhite: 1.0, alpha: 0.14)
+            : NSColor(calibratedWhite: 0.0, alpha: 0.07)
+    }
+    static let pill = NSColor(name: nil) { appearance in
+        appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+            ? NSColor(calibratedWhite: 1.0, alpha: 0.16)
+            : NSColor(calibratedWhite: 1.0, alpha: 1.0)
+    }
+    static let chip = NSColor(name: nil) { appearance in
+        appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+            ? NSColor(calibratedWhite: 1.0, alpha: 0.08)
+            : NSColor(calibratedWhite: 0.0, alpha: 0.05)
+    }
+}
 
 // MARK: - DDC layer (via m1ddc)
 
@@ -50,10 +82,9 @@ enum DDC {
     @discardableResult
     static func setLuminance(_ v: Int) -> String? { run(["set", "luminance", "\(max(0, min(100, v)))"]) }
     static func setContrast(_ v: Int) { run(["set", "contrast", "\(max(0, min(100, v)))"]) }
-    static func changeLuminance(_ d: Int) { run(["chg", "luminance", d > 0 ? "+\(d)" : "\(d)"]) }
 }
 
-// MARK: - Movie mode (DDC backlight boost; no gamma tables)
+// MARK: - Movie mode (DDC backlight boost)
 
 final class MovieMode {
     private var saved: (lum: Int, con: Int)?
@@ -79,9 +110,8 @@ final class MovieMode {
     }
 }
 
-// MARK: - Built-in display brightness (private DisplayServices API)
+// MARK: - Built-in display brightness
 
-typealias DSGetBrightness = @convention(c) (Int32) -> Int32
 typealias DSGetBrightnessValue = @convention(c) (UnsafeMutablePointer<Float>) -> Int32
 
 final class BuiltinBrightness {
@@ -129,71 +159,24 @@ final class SyncEngine {
     let builtin = BuiltinBrightness()
     var enabled = false
     var lastSent: Int?
+    var onToggle: (() -> Void)?
 
     /// Poll once per second; call from main run loop timer.
     func tick(movieMode: MovieMode) {
-        // movie mode toggle requested via `luminos --movie` (no Accessibility needed)
+        // movie mode toggle requested via `luminos --movie`
         let flag = "/tmp/luminos_movie_toggle"
         if FileManager.default.fileExists(atPath: flag) {
             try? FileManager.default.removeItem(atPath: flag)
             movieMode.toggle()
         }
         guard enabled, !movieMode.isOn else { return }
-        guard let b = builtin.value(), b >= 0 else { NSLog("luminos: sync tick, builtin read failed"); return }
+        guard let b = builtin.value(), b >= 0 else { return }
         let mapped = SYNC_MIN + Int((Float(SYNC_MAX - SYNC_MIN) * b).rounded())
         if let last = lastSent, abs(mapped - last) < SYNC_HYSTERESIS { return }
         lastSent = mapped
-        let r = DDC.setLuminance(mapped)
-        NSLog("luminos: sync set luminance=\(mapped) (builtin=\(b)) result=\(r ?? "nil")")
+        DDC.setLuminance(mapped)
+        NSLog("luminos: sync set luminance=\(mapped) (builtin=\(b))")
     }
-}
-
-// MARK: - Event tap
-
-let movieMode = MovieMode()
-let sync = SyncEngine()
-
-let args = CommandLine.arguments
-sync.enabled = args.contains("--sync")
-
-func handleSystemDefined(_ event: CGEvent) -> Unmanaged<CGEvent>? {
-    guard let ns = NSEvent(cgEvent: event), ns.subtype.rawValue == 8 else {
-        return Unmanaged.passUnretained(event)
-    }
-    let key = (ns.data1 & 0xFFFF_0000) >> 16
-    let keyFlags = ns.data1 & 0xFF00
-    guard keyFlags == 0x0A00 else { return Unmanaged.passUnretained(event) } // key down only
-    // NX_KEYTYPE_BRIGHTNESS_UP = 2, BRIGHTNESS_DOWN = 3
-    if key == 2 {
-        DispatchQueue.global().async { DDC.changeLuminance(STEP) }
-    } else if key == 3 {
-        DispatchQueue.global().async { DDC.changeLuminance(-STEP) }
-    }
-    return Unmanaged.passUnretained(event)  // let the system adjust the built-in too
-}
-
-func eventCallback(proxy: CGEventTapProxy, type: CGEventType, event: CGEvent, refcon: UnsafeMutableRawPointer?) -> Unmanaged<CGEvent>? {
-    if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
-        if let tap = gTap { CGEvent.tapEnable(tap: tap, enable: true) }
-        return Unmanaged.passUnretained(event)
-    }
-    if type.rawValue == 14 { // NX_SYSDEFINED (media keys)
-        if let ns = NSEvent(cgEvent: event) {
-            NSLog("luminos: sysdef subtype=\(ns.subtype.rawValue) data1=\(String(ns.data1, radix: 16))")
-        } else {
-            NSLog("luminos: sysdef event, NSEvent conversion failed")
-        }
-        return handleSystemDefined(event)
-    }
-    if type == .keyDown {
-        let kc = event.getIntegerValueField(.keyboardEventKeycode)
-        NSLog("luminos: keyDown keycode=\(kc)")
-        if kc == KEYCODE_F17 {
-            DispatchQueue.global().async { movieMode.toggle() }
-            return nil // consume F17
-        }
-    }
-    return Unmanaged.passUnretained(event)
 }
 
 // MARK: - Gamma control (CoreGraphics transfer formula, per-display)
@@ -210,22 +193,194 @@ enum Gamma {
     }
 
     static func set(_ g: Float) {
-        let v = max(0.5, min(3.5, g))
+        let v = max(GAMMA_MIN, min(GAMMA_MAX, g))
         CGSetDisplayTransferByFormula(displayID, 0, 1, v, 0, 1, v, 0, 1, v)
     }
+}
 
-    static func reset() { set(1.0) }
+// MARK: - UI helpers
+
+private func makeLabel(_ text: String, _ size: CGFloat, _ color: NSColor,
+                       weight: NSFont.Weight = .regular) -> NSTextField {
+    let f = NSTextField(labelWithString: text)
+    f.font = .systemFont(ofSize: size, weight: weight)
+    f.textColor = color
+    return f
+}
+
+private func trackedLabel(_ text: String, _ size: CGFloat, _ color: NSColor,
+                          weight: NSFont.Weight, tracking: CGFloat) -> NSTextField {
+    let f = NSTextField(labelWithString: "")
+    let attr = NSAttributedString(string: text, attributes: [
+        .font: NSFont.systemFont(ofSize: size, weight: weight),
+        .foregroundColor: color,
+        .kern: tracking,
+    ])
+    f.attributedStringValue = attr
+    return f
+}
+
+private func roundedView(_ frame: NSRect, _ color: NSColor, radius: CGFloat) -> NSView {
+    let v = NSView(frame: frame)
+    v.wantsLayer = true
+    v.layer?.backgroundColor = color.cgColor
+    v.layer?.cornerRadius = radius
+    return v
+}
+
+// MARK: - Capsule slider cell (rounded track + iOS-style knob)
+
+final class CapsuleSliderCell: NSSliderCell {
+    private let trackH: CGFloat = 28
+
+    override func drawBar(inside rect: NSRect, flipped: Bool) {
+        let r = NSRect(x: rect.minX, y: rect.midY - trackH / 2, width: rect.width, height: trackH)
+        Palette.track.setFill()
+        NSBezierPath(roundedRect: r, xRadius: trackH / 2, yRadius: trackH / 2).fill()
+        NSGraphicsContext.current?.saveGraphicsState()
+        NSBezierPath(roundedRect: r, xRadius: trackH / 2, yRadius: trackH / 2).setClip()
+        // filled portion up to the knob
+        let filled = NSRect(x: r.minX, y: r.minY, width: knobRect(flipped: flipped).midX - r.minX, height: r.height)
+        NSColor(calibratedWhite: 1.0, alpha: 0.22).setFill()
+        filled.fill()
+        NSGraphicsContext.current?.restoreGraphicsState()
+    }
+
+    override func drawKnob(_ knobRect: NSRect) {
+        let d: CGFloat = 22
+        let r = NSRect(x: knobRect.midX - d / 2, y: knobRect.midY - d / 2, width: d, height: d)
+        let shadow = NSShadow()
+        shadow.shadowColor = NSColor(calibratedWhite: 0, alpha: 0.3)
+        shadow.shadowBlurRadius = 3
+        shadow.shadowOffset = NSSize(width: 0, height: -1)
+        NSGraphicsContext.current?.saveGraphicsState()
+        shadow.set()
+        NSColor.white.setFill()
+        NSBezierPath(ovalIn: r).fill()
+        NSGraphicsContext.current?.restoreGraphicsState()
+    }
+}
+
+// MARK: - Magnetic slider
+
+final class GammaSlider: NSSlider {
+    var onSnap: ((Float) -> Void)?
+    private var snappedValue: Float?
+
+    override func mouseDown(with event: NSEvent) { super.mouseDown(with: event) }
+}
+
+// MARK: - Preset capsule (segmented control, custom-drawn)
+
+final class PresetCapsule: NSView {
+    let values: [(String, Float)]
+    var onSelect: (Float) -> Void
+    private var buttons: [NSButton] = []
+    private var pill: NSView!
+
+    init(frame: NSRect, values: [(String, Float)], onSelect: @escaping (Float) -> Void) {
+        self.values = values
+        self.onSelect = onSelect
+        super.init(frame: frame)
+        wantsLayer = true
+        layer?.backgroundColor = Palette.track.cgColor
+        layer?.cornerRadius = frame.height / 2
+
+        pill = roundedView(.zero, Palette.pill, radius: (frame.height - 8) / 2)
+        pill.layer?.shadowColor = NSColor.black.cgColor
+        pill.layer?.shadowOpacity = 0.15
+        pill.layer?.shadowRadius = 2
+        pill.layer?.shadowOffset = NSSize(width: 0, height: -1)
+        addSubview(pill)
+
+        let bw = frame.width / CGFloat(values.count)
+        for (i, v) in values.enumerated() {
+            let b = NSButton(title: v.0, target: self, action: #selector(tapped(_:)))
+            b.isBordered = false
+            b.frame = NSRect(x: bw * CGFloat(i), y: 0, width: bw, height: frame.height)
+            b.font = .systemFont(ofSize: 13, weight: .medium)
+            b.tag = i
+            (b.cell as? NSButtonCell)?.backgroundColor = .clear
+            b.contentTintColor = .secondaryLabelColor
+            addSubview(b)
+            buttons.append(b)
+        }
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    @objc private func tapped(_ sender: NSButton) {
+        onSelect(values[sender.tag].1)
+    }
+
+    /// Move the highlight pill to the preset matching `g`, or hide it.
+    func highlight(_ g: Float) {
+        var idx: Int?
+        for (i, v) in values.enumerated() where abs(v.1 - g) < 0.005 { idx = i }
+        let bw = frame.width / CGFloat(values.count)
+        if let i = idx {
+            pill.isHidden = false
+            pill.frame = NSRect(x: bw * CGFloat(i) + 4, y: 4, width: bw - 8, height: frame.height - 8)
+            for (j, b) in buttons.enumerated() {
+                b.contentTintColor = j == i ? .labelColor : .secondaryLabelColor
+            }
+        } else {
+            pill.isHidden = true
+            for b in buttons { b.contentTintColor = .secondaryLabelColor }
+        }
+    }
+}
+
+// MARK: - Toggle row (icon chip + title/subtitle + switch)
+
+final class ToggleRow: NSView {
+    let toggle: NSSwitch
+
+    init(frame: NSRect, icon: String, title: String, subtitle: String,
+         target: AnyObject, action: Selector) {
+        toggle = NSSwitch()
+        super.init(frame: frame)
+
+        let chip = roundedView(NSRect(x: 0, y: (frame.height - 30) / 2, width: 30, height: 30), Palette.chip, radius: 8)
+        let img = NSImageView(frame: NSRect(x: 6, y: 6, width: 18, height: 18))
+        img.image = NSImage(systemSymbolName: icon, accessibilityDescription: nil)
+        img.contentTintColor = .secondaryLabelColor
+        img.imageScaling = .scaleProportionallyUpOrDown
+        chip.addSubview(img)
+        addSubview(chip)
+
+        let t = makeLabel(title, 13, .labelColor, weight: .semibold)
+        t.frame = NSRect(x: 40, y: frame.height - 22, width: 170, height: 17)
+        addSubview(t)
+        let s = makeLabel(subtitle, 10.5, .secondaryLabelColor)
+        s.frame = NSRect(x: 40, y: frame.height - 39, width: 180, height: 14)
+        addSubview(s)
+
+        toggle.target = target
+        toggle.action = action
+        toggle.controlSize = .regular
+        toggle.sizeToFit()
+        toggle.frame.origin = NSPoint(x: frame.width - toggle.frame.width,
+                                      y: (frame.height - toggle.frame.height) / 2)
+        addSubview(toggle)
+    }
+    required init?(coder: NSCoder) { fatalError() }
 }
 
 // MARK: - Status bar UI
 
 final class StatusBar: NSObject {
+    static let menuW: CGFloat = 300
+
     let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-    let syncItem = NSMenuItem(title: "Sync with built-in display", action: #selector(toggleSync), keyEquivalent: "")
-    let movieItem = NSMenuItem(title: "Movie Mode (backlight boost)", action: #selector(toggleMovie), keyEquivalent: "")
-    private var gammaValue: NSTextField!
-    private var slider: NSSlider!
-    private var presetButtons: [(NSButton, Float)] = []
+
+    private var liveBadge: NSView!
+    private var heroValue: NSTextField!
+    private var slider: GammaSlider!
+    private var capsule: PresetCapsule!
+    private var syncRow: ToggleRow!
+    private var movieRow: ToggleRow!
+
+    private var lastSnapped: Float?
 
     override init() {
         super.init()
@@ -241,94 +396,192 @@ final class StatusBar: NSObject {
 
         let menu = NSMenu()
         menu.addItem(makeHeaderItem())
-        menu.addItem(.separator())
         menu.addItem(makeGammaItem())
+        menu.addItem(makePresetsItem())
         menu.addItem(.separator())
-        syncItem.target = self
-        syncItem.state = sync.enabled ? .on : .off
-        menu.addItem(syncItem)
-        movieItem.target = self
-        menu.addItem(movieItem)
+        syncRow = ToggleRow(frame: rowFrame(), icon: "rectangle.on.rectangle",
+                            title: "Sync with built-in display", subtitle: "Auto-adjusts with MacBook",
+                            target: self, action: #selector(toggleSync))
+        menu.addItem(item(with: syncRow))
+        movieRow = ToggleRow(frame: rowFrame(), icon: "film",
+                             title: "Movie Mode", subtitle: "Backlight boost for dark scenes",
+                             target: self, action: #selector(toggleMovie))
+        menu.addItem(item(with: movieRow))
         menu.addItem(.separator())
         let quit = NSMenuItem(title: "Quit Luminos", action: #selector(quit), keyEquivalent: "q")
         quit.target = self
         menu.addItem(quit)
         menu.delegate = self
         item.menu = menu
+
+        sync.onToggle = { [weak self] in self?.refreshToggles() }
     }
 
-    private func label(_ text: String, _ size: CGFloat, _ color: NSColor, bold: Bool = false) -> NSTextField {
-        let f = NSTextField(labelWithString: text)
-        f.font = bold ? .boldSystemFont(ofSize: size) : .systemFont(ofSize: size)
-        f.textColor = color
-        return f
+    private func rowFrame() -> NSRect { NSRect(x: 0, y: 0, width: StatusBar.menuW - 28, height: 48) }
+
+    private func item(with v: NSView) -> NSMenuItem {
+        let i = NSMenuItem()
+        i.view = NSView(frame: NSRect(x: 0, y: 0, width: StatusBar.menuW, height: v.frame.height + 8))
+        v.frame.origin = NSPoint(x: 14, y: 4)
+        i.view?.addSubview(v)
+        return i
     }
+
+    // MARK: Header (icon chip, name, status, LIVE badge)
 
     private func makeHeaderItem() -> NSMenuItem {
-        let v = NSView(frame: NSRect(x: 0, y: 0, width: 250, height: 44))
-        let title = label("Luminos", 14, .labelColor, bold: true)
-        title.frame = NSRect(x: 16, y: 16, width: 200, height: 20)
-        let sub = label("Mi Monitor", 10, .secondaryLabelColor)
-        sub.frame = NSRect(x: 16, y: 2, width: 200, height: 14)
-        v.addSubview(title); v.addSubview(sub)
-        let item = NSMenuItem()
-        item.view = v
-        return item
+        let v = NSView(frame: NSRect(x: 0, y: 0, width: StatusBar.menuW, height: 64))
+
+        let chip = roundedView(NSRect(x: 18, y: 12, width: 40, height: 40), Palette.chip, radius: 10)
+        let img = NSImageView(frame: NSRect(x: 9, y: 9, width: 22, height: 22))
+        img.image = NSImage(systemSymbolName: "display", accessibilityDescription: nil)
+        img.contentTintColor = .labelColor
+        img.imageScaling = .scaleProportionallyUpOrDown
+        chip.addSubview(img)
+        v.addSubview(chip)
+
+        // status dot
+        let dot = roundedView(NSRect(x: 46, y: 12, width: 10, height: 10), .systemGreen, radius: 5)
+        dot.layer?.borderColor = NSColor.windowBackgroundColor.cgColor
+        dot.layer?.borderWidth = 1.5
+        v.addSubview(dot)
+
+        let title = makeLabel("Luminos", 16, .labelColor, weight: .bold)
+        title.frame = NSRect(x: 68, y: 30, width: 150, height: 21)
+        v.addSubview(title)
+        let sub = makeLabel("Mi Monitor", 11.5, .secondaryLabelColor)
+        sub.frame = NSRect(x: 68, y: 13, width: 150, height: 15)
+        v.addSubview(sub)
+
+        liveBadge = NSView(frame: NSRect(x: StatusBar.menuW - 70, y: 24, width: 52, height: 22))
+        liveBadge.wantsLayer = true
+        liveBadge.layer?.backgroundColor = NSColor.systemGreen.withAlphaComponent(0.15).cgColor
+        liveBadge.layer?.cornerRadius = 11
+        let lt = makeLabel("LIVE", 10, .systemGreen, weight: .bold)
+        lt.alignment = .center
+        lt.frame = NSRect(x: 0, y: 3, width: 52, height: 15)
+        liveBadge.addSubview(lt)
+        v.addSubview(liveBadge)
+
+        let i = NSMenuItem()
+        i.view = v
+        return i
     }
 
-    private func makeGammaItem() -> NSMenuItem {
-        let w: CGFloat = 250
-        let v = NSView(frame: NSRect(x: 0, y: 0, width: w, height: 108))
+    // MARK: Gamma slider section
 
-        let head = label("GAMMA", 9, .secondaryLabelColor, bold: true)
-        head.frame = NSRect(x: 16, y: 88, width: 120, height: 12)
+    private func makeGammaItem() -> NSMenuItem {
+        let w = StatusBar.menuW
+        let v = NSView(frame: NSRect(x: 0, y: 0, width: w, height: 132))
+
+        let head = trackedLabel("GAMMA", 10, .secondaryLabelColor, weight: .semibold, tracking: 2.2)
+        head.frame = NSRect(x: 20, y: 104, width: 120, height: 14)
         v.addSubview(head)
 
-        gammaValue = label("1.00", 13, NSColor(calibratedRed: 1.0, green: 0.82, blue: 0.35, alpha: 1), bold: true)
-        gammaValue.alignment = .right
-        gammaValue.frame = NSRect(x: w - 66, y: 84, width: 50, height: 18)
-        v.addSubview(gammaValue)
+        heroValue = NSTextField(labelWithString: "")
+        heroValue.alignment = .right
+        heroValue.frame = NSRect(x: w - 150, y: 88, width: 130, height: 32)
+        setHero(1.0)
+        v.addSubview(heroValue)
 
-        slider = NSSlider(value: 1.0, minValue: 0.5, maxValue: 3.5, target: self, action: #selector(sliderChanged))
+        slider = GammaSlider(value: 1.0, minValue: Double(GAMMA_MIN), maxValue: Double(GAMMA_MAX),
+                             target: self, action: #selector(sliderChanged))
+        slider.cell = CapsuleSliderCell()
+        slider.cell?.controlSize = .regular
         slider.isContinuous = true
-        slider.frame = NSRect(x: 16, y: 56, width: w - 32, height: 24)
+        slider.frame = NSRect(x: 16, y: 50, width: w - 32, height: 32)
         v.addSubview(slider)
 
-        let presets: [(String, Float)] = [("Reset", 1.0), ("1.3", 1.3), ("1.6", 1.6), ("2.2", 2.2)]
-        var px: CGFloat = 16
-        for (title, val) in presets {
-            let b = NSButton(title: title, target: self, action: #selector(presetTapped(_:)))
-            b.bezelStyle = .inline
-            b.controlSize = .small
-            b.tag = presetButtons.count
-            b.frame = NSRect(x: px, y: 18, width: 52, height: 26)
-            presetButtons.append((b, val))
-            v.addSubview(b)
-            px += 56
+        // tick labels
+        let ticks: [Float] = [0.8, 1.2, 1.6, 2.0, 2.4]
+        let usable = w - 32
+        for t in ticks {
+            let frac = CGFloat((t - GAMMA_MIN) / (GAMMA_MAX - GAMMA_MIN))
+            let l = makeLabel(String(format: "%.1f", t), 9.5, .tertiaryLabelColor)
+            l.alignment = .center
+            l.frame = NSRect(x: 16 + frac * usable - 14, y: 34, width: 28, height: 12)
+            v.addSubview(l)
         }
 
-        let item = NSMenuItem()
-        item.view = v
-        return item
+        let i = NSMenuItem()
+        i.view = v
+        return i
+    }
+
+    // MARK: Preset capsule
+
+    private func makePresetsItem() -> NSMenuItem {
+        capsule = PresetCapsule(
+            frame: NSRect(x: 16, y: 0, width: StatusBar.menuW - 32, height: 38),
+            values: [("Default", 1.0), ("1.3", 1.3), ("1.6", 1.6), ("2.2", 2.2)]
+        ) { [weak self] g in self?.applyGamma(g) }
+
+        let v = NSView(frame: NSRect(x: 0, y: 0, width: StatusBar.menuW, height: 52))
+        capsule.frame.origin = NSPoint(x: 16, y: 7)
+        v.addSubview(capsule)
+        let i = NSMenuItem()
+        i.view = v
+        return i
+    }
+
+    // MARK: Behavior
+
+    private func setHero(_ g: Float) {
+        let attr = NSMutableAttributedString(string: String(format: "%.2f", g), attributes: [
+            .font: NSFont.monospacedDigitSystemFont(ofSize: 26, weight: .semibold),
+            .foregroundColor: Palette.hero,
+        ])
+        attr.append(NSAttributedString(string: " γ", attributes: [
+            .font: NSFont.systemFont(ofSize: 13, weight: .medium),
+            .foregroundColor: NSColor.tertiaryLabelColor,
+            .baselineOffset: 1,
+        ]))
+        heroValue.attributedStringValue = attr
     }
 
     private func applyGamma(_ g: Float) {
         Gamma.set(g)
         slider.doubleValue = Double(g)
-        gammaValue.stringValue = String(format: "%.2f", g)
+        setHero(g)
+        capsule.highlight(g)
     }
 
-    @objc func sliderChanged() { applyGamma(Float(slider.doubleValue)) }
+    @objc func sliderChanged() {
+        var g = Float(slider.doubleValue)
+        // magnetic snap
+        var snap: Float?
+        for s in GAMMA_SNAPS where abs(g - s) < GAMMA_SNAP_THRESHOLD { snap = s }
+        if let s = snap {
+            g = s
+            slider.doubleValue = Double(s)
+            if lastSnapped != s {
+                NSHapticFeedbackManager.defaultPerformer.perform(.alignment, performanceTime: .now)
+                lastSnapped = s
+            }
+        } else {
+            lastSnapped = nil
+        }
+        Gamma.set(g)
+        setHero(g)
+        capsule.highlight(g)
+    }
 
-    @objc func presetTapped(_ sender: NSButton) { applyGamma(presetButtons[sender.tag].1) }
+    private func refreshToggles() {
+        syncRow.toggle.state = sync.enabled ? .on : .off
+        movieRow.toggle.state = movieMode.isOn ? .on : .off
+        liveBadge.isHidden = !sync.enabled
+    }
 
     @objc func toggleSync() {
         sync.enabled.toggle()
-        syncItem.state = sync.enabled ? .on : .off
+        refreshToggles()
     }
 
     @objc func toggleMovie() {
-        DispatchQueue.global().async { movieMode.toggle() }
+        DispatchQueue.global().async {
+            movieMode.toggle()
+            DispatchQueue.main.async { self.refreshToggles() }
+        }
     }
 
     @objc func quit() { NSApp.terminate(nil) }
@@ -338,16 +591,21 @@ extension StatusBar: NSMenuDelegate {
     func menuWillOpen(_ menu: NSMenu) {
         let g = Gamma.get()
         slider.doubleValue = Double(g)
-        gammaValue.stringValue = String(format: "%.2f", g)
-        movieItem.state = movieMode.isOn ? .on : .off
+        setHero(g)
+        capsule.highlight(g)
+        refreshToggles()
     }
 }
 
 // MARK: - main
 
-var gTap: CFMachPort?
+let movieMode = MovieMode()
+let sync = SyncEngine()
 
-if CommandLine.arguments.contains("--test") {
+let args = CommandLine.arguments
+sync.enabled = args.contains("--sync")
+
+if args.contains("--test") {
     print("luminance:", DDC.getLuminance() ?? -1)
     print("contrast:", DDC.getContrast() ?? -1)
     print("builtin:", sync.builtin.value() ?? -1)
@@ -369,47 +627,17 @@ if CommandLine.arguments.contains("--test") {
     exit(0)
 }
 
-if CommandLine.arguments.contains("--movie") {
+if args.contains("--movie") {
     // signal the running daemon to toggle movie mode
     FileManager.default.createFile(atPath: "/tmp/luminos_movie_toggle", contents: nil)
     print("movie mode toggled")
     exit(0)
 }
 
-let mask = (1 << CGEventType.keyDown.rawValue) | (1 << 14 /* NX_SYSDEFINED */)
-var tapStarted = false
+// 1s tick: handles the --movie flag and, when enabled, the sync engine
+Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { _ in sync.tick(movieMode: movieMode) }
 
-func tryStartTap() -> Bool {
-    if tapStarted { return true }
-    guard AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedValue(): false] as CFDictionary),
-          let tap = CGEvent.tapCreate(
-              tap: .cgSessionEventTap,
-              place: .headInsertEventTap,
-              options: .defaultTap,
-              eventsOfInterest: CGEventMask(mask),
-              callback: eventCallback,
-              userInfo: nil
-          ) else { return false }
-    gTap = tap
-    let src = CFMachPortCreateRunLoopSource(nil, tap, 0)
-    CFRunLoopAddSource(CFRunLoopGetMain(), src, .commonModes)
-    CGEvent.tapEnable(tap: tap, enable: true)
-    tapStarted = true
-    NSLog("luminos: event tap started (keys enabled)")
-    return true
-}
-
-if !tryStartTap() {
-    NSLog("luminos: no Accessibility permission — running sync-only (keys disabled)")
-    // re-check every 30s so a later grant activates the keys without a restart
-    Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { _ in _ = tryStartTap() }
-}
-
-if sync.enabled {
-    Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { _ in sync.tick(movieMode: movieMode) }
-}
-
-// Status bar (needs an NSApplication; accessory policy = no Dock icon)
+// Status bar (accessory policy = no Dock icon)
 let app = NSApplication.shared
 app.setActivationPolicy(.accessory)
 let statusBar = StatusBar()
