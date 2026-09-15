@@ -18,7 +18,8 @@ import Cocoa
 // MARK: - Config
 
 let M1DDC = "/opt/homebrew/bin/m1ddc"
-let DISPLAY_ARG = "2"              // m1ddc display index of the external monitor
+let MOVIE_FLAG = "/tmp/luminos_movie_toggle"     // --movie → daemon handoff (timestamped)
+let TEST_PAUSE_FLAG = "/tmp/luminos_test_pause"  // --test suspends the daemon's sync writes
 let SYNC_MIN = 10                  // DDC luminance floor when syncing
 let SYNC_MAX = 100
 let SYNC_HYSTERESIS = 2            // ignore built-in changes smaller than this (mapped units)
@@ -60,73 +61,196 @@ enum Palette {
 // MARK: - DDC layer (via m1ddc)
 
 enum DDC {
+    /// All m1ddc traffic is serialized: concurrent DDC/CI transactions can
+    /// collide on the bus, and sync writes must not interleave with the
+    /// movie-mode read/save/write sequence.
+    static let queue = DispatchQueue(label: "dev.luminos.ddc")
+
+    /// m1ddc display index — resolved at startup (and again on DDC failure),
+    /// since the index re-enumerates when monitors are replugged.
+    static var displayArg = "1"
+
     @discardableResult
     static func run(_ args: [String]) -> String? {
+        let out = runOnce(["display", displayArg] + args)
+        if out != nil { return out }
+        // the display index likely shifted (replug/reboot) — re-resolve, retry once
+        resolveDisplay()
+        return runOnce(["display", displayArg] + args)
+    }
+
+    @discardableResult
+    static func runOnce(_ argv: [String]) -> String? {
         let p = Process()
         let out = Pipe()
         p.executableURL = URL(fileURLWithPath: M1DDC)
-        p.arguments = ["display", DISPLAY_ARG] + args
+        p.arguments = argv
         p.standardOutput = out
         p.standardError = FileHandle.nullDevice
         do {
             try p.run()
+            // read to EOF BEFORE waiting — waiting first deadlocks once the
+            // child fills the pipe buffer and blocks on write()
+            let data = out.fileHandleForReading.readDataToEndOfFile()
             p.waitUntilExit()
             guard p.terminationStatus == 0 else { return nil }
-            let s = String(data: out.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)
+            let s = String(data: data, encoding: .utf8)
             return s?.trimmingCharacters(in: .whitespacesAndNewlines)
         } catch { return nil }
+    }
+
+    /// Pick the first display m1ddc can address. `display list` prints lines
+    /// like "[1] (null) (UUID)" and only lists DDC-capable (external)
+    /// displays, so the first match is the monitor.
+    static func resolveDisplay() {
+        guard let out = runOnce(["display", "list"]),
+              let re = try? NSRegularExpression(pattern: #"\[(\d+)\]"#),
+              let m = re.firstMatch(in: out, range: NSRange(out.startIndex..., in: out)),
+              let r = Range(m.range(at: 1), in: out) else { return }
+        let idx = String(out[r])
+        guard idx != displayArg else { return }  // don't spam the log on repeated failures
+        displayArg = idx
+        NSLog("luminos: m1ddc display resolved to index \(displayArg)")
     }
 
     static func getLuminance() -> Int? { run(["get", "luminance"]).flatMap(Int.init) }
     static func getContrast() -> Int? { run(["get", "contrast"]).flatMap(Int.init) }
     @discardableResult
     static func setLuminance(_ v: Int) -> String? { run(["set", "luminance", "\(max(0, min(100, v)))"]) }
-    static func setContrast(_ v: Int) { run(["set", "contrast", "\(max(0, min(100, v)))"]) }
+    @discardableResult
+    static func setContrast(_ v: Int) -> String? { run(["set", "contrast", "\(max(0, min(100, v)))"]) }
 }
 
 // MARK: - Movie mode (DDC backlight boost)
 
 final class MovieMode {
+    private struct Save: Codable { let lum: Int; let con: Int }
+    private static let stateFile = NSHomeDirectory() + "/Library/Application Support/Luminos/movie-state.json"
+
+    /// Main-thread-confined state: `tick` runs on the main run loop and menu
+    /// actions arrive on the main thread, so no locking is needed as long as
+    /// nothing mutates MovieMode from a background queue (DDC work itself is
+    /// serialized on DDC.queue).
     private var saved: (lum: Int, con: Int)?
+    /// A restore whose DDC writes haven't reached the panel yet — left either
+    /// by a previous run (crash/quit/deploy while movie mode was on) or by a
+    /// failed toggle-off. Retried once per tick until it lands.
+    private var pendingRestore: (lum: Int, con: Int)?
+    private var restoreInFlight = false
+
     var isOn: Bool { saved != nil }
 
+    /// Called once at startup: adopt a state file left by an earlier run so
+    /// the monitor isn't stranded at 100/85 after a crash or deploy.
+    func ingestPersistedState() {
+        guard saved == nil, pendingRestore == nil,
+              let data = try? Data(contentsOf: URL(fileURLWithPath: Self.stateFile)),
+              let s = try? JSONDecoder().decode(Save.self, from: data) else { return }
+        NSLog("luminos: persisted movie state \(s.lum)/\(s.con) found; will restore")
+        pendingRestore = (s.lum, s.con)
+    }
+
+    /// Push any outstanding restore to the panel. Returns true while a
+    /// restore is still outstanding (sync must hold off until it lands).
+    @discardableResult
+    func restoreOutstanding() -> Bool {
+        guard let s = pendingRestore, !restoreInFlight else { return pendingRestore != nil }
+        restoreInFlight = true
+        DDC.queue.async { [weak self] in
+            let ok = DDC.setLuminance(s.lum) != nil && DDC.setContrast(s.con) != nil
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.restoreInFlight = false
+                guard ok else {
+                    NSLog("luminos: movie restore \(s.lum)/\(s.con) failed; will retry")
+                    return
+                }
+                NSLog("luminos: restored movie state \(s.lum)/\(s.con)")
+                self.pendingRestore = nil
+                try? FileManager.default.removeItem(atPath: Self.stateFile)
+                sync.invalidate()
+            }
+        }
+        return true
+    }
+
+    /// Synchronous best-effort restore on quit (applicationWillTerminate).
+    func restoreNowIfOn() {
+        guard let s = saved else { return }
+        let ok = DDC.queue.sync { DDC.setLuminance(s.lum) != nil && DDC.setContrast(s.con) != nil }
+        guard ok else {
+            NSLog("luminos: quit restore failed; state file kept for next launch")
+            return
+        }
+        saved = nil
+        pendingRestore = nil
+        try? FileManager.default.removeItem(atPath: Self.stateFile)
+        NSLog("luminos: restored movie state \(s.lum)/\(s.con) on quit")
+    }
+
+    /// Main thread only.
     func toggle() {
         if let s = saved {
-            DDC.setLuminance(s.lum)
-            DDC.setContrast(s.con)
             saved = nil
-            NSLog("luminos: movie mode off (restored \(s.lum)/\(s.con))")
+            pendingRestore = s
+            NSLog("luminos: movie mode off (restoring \(s.lum)/\(s.con))")
+            restoreOutstanding()
         } else {
-            guard let l = DDC.getLuminance(), let c = DDC.getContrast(),
-                  (0...100).contains(l), (0...100).contains(c) else {
+            pendingRestore = nil  // an explicit re-entry supersedes a pending restore
+            let (l, c) = DDC.queue.sync { (DDC.getLuminance(), DDC.getContrast()) }
+            guard let l, let c, (0...100).contains(l), (0...100).contains(c) else {
                 NSLog("luminos: movie mode on failed (bad DDC read)")
                 return
             }
             saved = (l, c)
-            DDC.setLuminance(MOVIE_LUMINANCE)
-            DDC.setContrast(MOVIE_CONTRAST)
+            persist((l, c))
+            DDC.queue.async {
+                let ok = DDC.setLuminance(MOVIE_LUMINANCE) != nil && DDC.setContrast(MOVIE_CONTRAST) != nil
+                if !ok { NSLog("luminos: movie mode boost writes failed (panel unavailable?)") }
+            }
             NSLog("luminos: movie mode on (saved \(l)/\(c))")
+        }
+    }
+
+    private func persist(_ s: (lum: Int, con: Int)) {
+        let dir = (Self.stateFile as NSString).deletingLastPathComponent
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        if let data = try? JSONEncoder().encode(Save(lum: s.lum, con: s.con)) {
+            try? data.write(to: URL(fileURLWithPath: Self.stateFile))
         }
     }
 }
 
 // MARK: - Built-in display brightness
 
-typealias DSGetBrightnessValue = @convention(c) (UnsafeMutablePointer<Float>) -> Int32
+/// Real ABI: int DisplayServicesGetBrightness(int display, float *brightness)
+typealias DSGetBrightnessFunc = @convention(c) (UInt32, UnsafeMutablePointer<Float>) -> Int32
 
 final class BuiltinBrightness {
-    private var getFn: DSGetBrightnessValue?
+    private var getFn: DSGetBrightnessFunc?
+    private let builtinID: CGDirectDisplayID?
+
     init() {
+        builtinID = Self.builtinDisplayID()
         let path = "/System/Library/PrivateFrameworks/DisplayServices.framework/DisplayServices"
         if let h = dlopen(path, RTLD_LAZY),
            let sym = dlsym(h, "DisplayServicesGetBrightness") {
-            getFn = unsafeBitCast(sym, to: DSGetBrightnessValue.self)
+            getFn = unsafeBitCast(sym, to: DSGetBrightnessFunc.self)
         }
     }
-    /// Primary source on Apple Silicon: parse corebrightnessdiag status-info,
-    /// taking the Brightness real inside the DisplayBrightness dict of the
-    /// built-in display's section. (IOKit's IODisplayGetFloatParameter returns
-    /// a frozen registry value on M1 — do not use it.)
+
+    /// The first online display marked built-in (nil in clamshell mode).
+    static func builtinDisplayID() -> CGDirectDisplayID? {
+        var ids = [CGDirectDisplayID](repeating: 0, count: 16)
+        var count: UInt32 = 0
+        guard CGGetOnlineDisplayList(16, &ids, &count) == .success else { return nil }
+        return ids.prefix(Int(count)).first { CGDisplayIsBuiltin($0) != 0 }
+    }
+
+    /// Fallback: parse corebrightnessdiag status-info. Spawns a subprocess —
+    /// expensive, so only used when the DisplayServices path above fails.
+    /// (IOKit's IODisplayGetFloatParameter returns a frozen registry value on
+    /// M1 — do not use it.)
     private func coreBrightnessValue() -> Float? {
         let p = Process()
         let out = Pipe()
@@ -134,9 +258,12 @@ final class BuiltinBrightness {
         p.arguments = ["status-info"]
         p.standardOutput = out
         p.standardError = FileHandle.nullDevice
-        guard let _ = try? p.run() else { return nil }
+        guard (try? p.run()) != nil else { return nil }
+        // read to EOF BEFORE waiting — waiting first deadlocks once the child
+        // fills the pipe buffer (this dump is far larger than 64 KB)
+        let data = out.fileHandleForReading.readDataToEndOfFile()
         p.waitUntilExit()
-        guard let s = String(data: out.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8),
+        guard let s = String(data: data, encoding: .utf8),
               let re = try? NSRegularExpression(
                   pattern: #"<key>DisplayBrightness</key>\s*<dict>\s*<key>Brightness</key>\s*<real>([0-9.]+)</real>"#),
               let m = re.firstMatch(in: s, range: NSRange(s.startIndex..., in: s)),
@@ -145,9 +272,9 @@ final class BuiltinBrightness {
     }
 
     func value() -> Float? {
-        if let f = getFn {
+        if let f = getFn, let id = builtinID {
             var v: Float = -1
-            if f(&v) == 0, v >= 0 { return v }
+            if f(id, &v) == 0, v >= 0 { return v }
         }
         return coreBrightnessValue()
     }
@@ -158,43 +285,127 @@ final class BuiltinBrightness {
 final class SyncEngine {
     let builtin = BuiltinBrightness()
     var enabled = false
+    /// Last luminance the panel actually accepted. Main-thread only.
     var lastSent: Int?
-    var onToggle: (() -> Void)?
+    private var writeInFlight = false
+    private var externalWasAbsent = false
+
+    /// Forget the last accepted write so the next tick sends a fresh value
+    /// (sync re-enable, movie-mode restore, …).
+    func invalidate() { lastSent = nil }
 
     /// Poll once per second; call from main run loop timer.
     func tick(movieMode: MovieMode) {
+        // --test suspends the daemon so its 1 s writes can't clobber the probe
+        if FileManager.default.fileExists(atPath: TEST_PAUSE_FLAG) { return }
+
         // movie mode toggle requested via `luminos --movie`
-        let flag = "/tmp/luminos_movie_toggle"
-        if FileManager.default.fileExists(atPath: flag) {
-            try? FileManager.default.removeItem(atPath: flag)
-            movieMode.toggle()
+        if let data = FileManager.default.contents(atPath: MOVIE_FLAG) {
+            try? FileManager.default.removeItem(atPath: MOVIE_FLAG)
+            let text = String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+            if let ts = Double(text) {
+                if Date().timeIntervalSince1970 - ts > 10 {
+                    NSLog("luminos: ignored stale movie flag")
+                } else {
+                    movieMode.toggle()
+                }
+            } else {
+                NSLog("luminos: ignored unparsable movie flag")
+            }
         }
+
+        // a pending movie restore takes priority over sync writes
+        if movieMode.restoreOutstanding() { return }
         guard enabled, !movieMode.isOn else { return }
+        // no external display online — skip before spawning any subprocess
+        guard Gamma.externalDisplayID() != nil else {
+            externalWasAbsent = true
+            return
+        }
+        if externalWasAbsent {
+            // the panel may have reset its backlight while gone
+            externalWasAbsent = false
+            lastSent = nil
+        }
         guard let b = builtin.value(), b >= 0 else { return }
         let mapped = SYNC_MIN + Int((Float(SYNC_MAX - SYNC_MIN) * b).rounded())
+        if writeInFlight { return }
         if let last = lastSent, abs(mapped - last) < SYNC_HYSTERESIS { return }
-        lastSent = mapped
-        DDC.setLuminance(mapped)
-        NSLog("luminos: sync set luminance=\(mapped) (builtin=\(b))")
+        writeInFlight = true
+        DDC.queue.async { [weak self] in
+            let out = DDC.setLuminance(mapped)
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.writeInFlight = false
+                if out != nil {
+                    // record "sent" only once the panel accepted the write;
+                    // a failure clears lastSent so the next tick retries
+                    self.lastSent = mapped
+                    NSLog("luminos: sync set luminance=\(mapped) (builtin=\(b))")
+                } else {
+                    self.lastSent = nil
+                    NSLog("luminos: sync luminance write failed; will retry")
+                }
+            }
+        }
     }
 }
 
 // MARK: - Gamma control (CoreGraphics transfer formula, per-display)
 
 enum Gamma {
-    static let displayID = CGDirectDisplayID(2)  // Mi Monitor
+    private static let defaultsKey = "lastGamma"
+    /// Last gamma applied or read. Main-thread state, persisted so the
+    /// setting survives launches and can be re-applied after sleep/replug.
+    private static var current: Float = 1.0
+
+    /// The first online display that isn't the built-in one. Never cache the
+    /// CGDirectDisplayID across calls — it changes on replug/reboot.
+    static func externalDisplayID() -> CGDirectDisplayID? {
+        var ids = [CGDirectDisplayID](repeating: 0, count: 16)
+        var count: UInt32 = 0
+        guard CGGetOnlineDisplayList(16, &ids, &count) == .success else { return nil }
+        let builtin = BuiltinBrightness.builtinDisplayID()
+        return ids.prefix(Int(count)).first { $0 != builtin }
+    }
 
     static func get() -> Float {
+        guard let id = externalDisplayID() else { return current }
         var rmin: Float = 0, rmax: Float = 1, rg: Float = 1
         var gmin: Float = 0, gmax: Float = 1, gg: Float = 1
         var bmin: Float = 0, bmax: Float = 1, bg: Float = 1
-        CGGetDisplayTransferByFormula(displayID, &rmin, &rmax, &rg, &gmin, &gmax, &gg, &bmin, &bmax, &bg)
-        return gg
+        if CGGetDisplayTransferByFormula(id, &rmin, &rmax, &rg, &gmin, &gmax, &gg, &bmin, &bmax, &bg) == .success {
+            current = gg
+        }
+        return current
     }
 
     static func set(_ g: Float) {
         let v = max(GAMMA_MIN, min(GAMMA_MAX, g))
-        CGSetDisplayTransferByFormula(displayID, 0, 1, v, 0, 1, v, 0, 1, v)
+        current = v
+        UserDefaults.standard.set(Double(v), forKey: defaultsKey)
+        apply(v)
+    }
+
+    /// Push the remembered gamma back to the external display. CoreGraphics
+    /// drops transfer functions whenever displays sleep or re-enumerate.
+    static func reapply() { apply(current) }
+
+    /// Seed from the persisted preference, else from the panel's current
+    /// transfer function; write to the panel only in the first case.
+    static func loadAtLaunch() {
+        if let stored = UserDefaults.standard.object(forKey: defaultsKey) as? Double {
+            current = max(GAMMA_MIN, min(GAMMA_MAX, Float(stored)))
+            apply(current)
+        } else {
+            _ = get()
+        }
+    }
+
+    private static func apply(_ v: Float) {
+        guard let id = externalDisplayID() else { return }
+        let err = CGSetDisplayTransferByFormula(id, 0, 1, v, 0, 1, v, 0, 1, v)
+        if err != .success { NSLog("luminos: gamma set failed (err \(err.rawValue))") }
     }
 }
 
@@ -271,12 +482,7 @@ final class CapsuleSliderCell: NSSliderCell {
 
 // MARK: - Magnetic slider
 
-final class GammaSlider: NSSlider {
-    var onSnap: ((Float) -> Void)?
-    private var snappedValue: Float?
-
-    override func mouseDown(with event: NSEvent) { super.mouseDown(with: event) }
-}
+final class GammaSlider: NSSlider {}
 
 // MARK: - Preset capsule (segmented control, custom-drawn)
 
@@ -426,8 +632,6 @@ final class StatusBar: NSObject {
         menu.addItem(quit)
         menu.delegate = self
         item.menu = menu
-
-        sync.onToggle = { [weak self] in self?.refreshToggles() }
     }
 
     private func rowFrame() -> NSRect { NSRect(x: 0, y: 0, width: StatusBar.menuW - 28, height: 48) }
@@ -592,14 +796,15 @@ final class StatusBar: NSObject {
 
     @objc func toggleSync() {
         sync.enabled.toggle()
+        if sync.enabled { sync.invalidate() }  // force a fresh write; stale hysteresis state would swallow it
         refreshToggles()
     }
 
     @objc func toggleMovie() {
-        DispatchQueue.global().async {
-            movieMode.toggle()
-            DispatchQueue.main.async { self.refreshToggles() }
-        }
+        // stay on the main thread: MovieMode state is main-thread-confined,
+        // and its DDC traffic serializes on DDC.queue internally
+        movieMode.toggle()
+        refreshToggles()
     }
 
     @objc func quit() { NSApp.terminate(nil) }
@@ -617,6 +822,34 @@ extension StatusBar: NSMenuDelegate {
 
 // MARK: - main
 
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    func applicationWillTerminate(_ notification: Notification) {
+        // best effort on Quit/bootout; a hard kill is covered by the
+        // persisted state file, which the next launch restores
+        movieMode.restoreNowIfOn()
+    }
+}
+
+/// True if a Luminos daemon process other than ourselves is running.
+func daemonRunning() -> Bool {
+    let p = Process()
+    let out = Pipe()
+    p.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
+    p.arguments = ["-f", "Luminos.app/Contents/MacOS/Luminos"]
+    p.standardOutput = out
+    p.standardError = FileHandle.nullDevice
+    guard (try? p.run()) != nil else { return false }
+    // read to EOF before waitUntilExit (pipe discipline)
+    let data = out.fileHandleForReading.readDataToEndOfFile()
+    p.waitUntilExit()
+    guard p.terminationStatus == 0 else { return false }
+    let myPid = ProcessInfo.processInfo.processIdentifier
+    let pids = String(decoding: data, as: UTF8.self)
+        .split(whereSeparator: \.isNewline)
+        .compactMap { Int32($0.trimmingCharacters(in: .whitespaces)) }
+    return pids.contains { $0 != myPid }
+}
+
 let movieMode = MovieMode()
 let sync = SyncEngine()
 
@@ -624,40 +857,79 @@ let args = CommandLine.arguments
 sync.enabled = args.contains("--sync")
 
 if args.contains("--test") {
-    print("luminance:", DDC.getLuminance() ?? -1)
-    print("contrast:", DDC.getContrast() ?? -1)
-    print("builtin:", sync.builtin.value() ?? -1)
-    // probe whether the monitor honors DDC luminance writes
-    if let orig = DDC.getLuminance(), (0...100).contains(orig) {
-        let probe = orig >= 90 ? orig - 10 : orig + 10
-        DDC.setLuminance(probe)
-        Thread.sleep(forTimeInterval: 1.5)
-        let after = DDC.getLuminance()
-        DDC.setLuminance(orig)  // restore
-        if after == probe {
-            print("ddc-write: ok (luminance writes accepted)")
+    do {
+        // suspend the daemon's sync loop so its writes can't clobber the probe
+        FileManager.default.createFile(atPath: TEST_PAUSE_FLAG, contents: nil)
+        defer { try? FileManager.default.removeItem(atPath: TEST_PAUSE_FLAG) }
+        Thread.sleep(forTimeInterval: 1.2)  // let any in-flight daemon write finish
+        print("luminance:", DDC.getLuminance() ?? -1)
+        print("contrast:", DDC.getContrast() ?? -1)
+        print("builtin:", sync.builtin.value() ?? -1)
+        // probe whether the monitor honors DDC luminance writes
+        if let orig = DDC.getLuminance(), (0...100).contains(orig) {
+            let probe = orig >= 90 ? orig - 10 : orig + 10
+            DDC.setLuminance(probe)
+            Thread.sleep(forTimeInterval: 1.5)
+            let after = DDC.getLuminance()
+            DDC.setLuminance(orig)  // restore
+            if after == probe {
+                print("ddc-write: ok (luminance writes accepted)")
+            } else {
+                print("ddc-write: REJECTED (monitor ignores luminance writes; read back \(after ?? -1), expected \(probe))")
+            }
         } else {
-            print("ddc-write: REJECTED (monitor ignores luminance writes; read back \(after ?? -1), expected \(probe))")
+            print("ddc-write: skipped (no valid luminance read)")
         }
-    } else {
-        print("ddc-write: skipped (no valid luminance read)")
     }
     exit(0)
 }
 
 if args.contains("--movie") {
-    // signal the running daemon to toggle movie mode
-    FileManager.default.createFile(atPath: "/tmp/luminos_movie_toggle", contents: nil)
+    guard daemonRunning() else {
+        FileHandle.standardError.write(Data("luminos: daemon is not running; movie flag not written\n".utf8))
+        exit(1)
+    }
+    // timestamped so the daemon can drop a flag that outlives its window
+    let stamp = String(format: "%.0f", Date().timeIntervalSince1970)
+    FileManager.default.createFile(atPath: MOVIE_FLAG, contents: Data(stamp.utf8))
     print("movie mode toggled")
     exit(0)
 }
 
-// 1s tick: handles the --movie flag and, when enabled, the sync engine
+DDC.resolveDisplay()
+movieMode.ingestPersistedState()
+Gamma.loadAtLaunch()
+
+// 1s tick: handles the --movie flag, pending restores, and the sync engine
 Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { _ in sync.tick(movieMode: movieMode) }
 
 // Status bar (accessory policy = no Dock icon)
 let app = NSApplication.shared
 app.setActivationPolicy(.accessory)
+let appDelegate = AppDelegate()
+app.delegate = appDelegate
+
+// gamma survives sleep and replug: CoreGraphics drops transfer functions
+// whenever displays sleep or re-enumerate, so push the value back
+let wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
+    forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { _ in
+    DispatchQueue.main.asyncAfter(deadline: .now() + 1) { Gamma.reapply() }
+}
+let screensObserver = NSWorkspace.shared.notificationCenter.addObserver(
+    forName: NSWorkspace.screensDidWakeNotification, object: nil, queue: .main) { _ in
+    DispatchQueue.main.asyncAfter(deadline: .now() + 1) { Gamma.reapply() }
+}
+_ = wakeObserver
+_ = screensObserver
+
+// keep the C callback alive for the process lifetime
+var displayConfigHandler: CGDisplayReconfigurationCallBack = { _, flags, _ in
+    // react to mode changes and displays appearing/disappearing (sleep, replug)
+    guard flags.contains(.setModeFlag) || flags.contains(.addFlag)
+           || flags.contains(.removeFlag) || flags.contains(.enabledFlag) else { return }
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { Gamma.reapply() }
+}
+CGDisplayRegisterReconfigurationCallback(displayConfigHandler, nil)
 
 let statusBar = StatusBar()
 _ = statusBar

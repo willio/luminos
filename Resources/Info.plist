@@ -7,7 +7,7 @@
     <key>CFBundleDisplayName</key>
     <string>Luminos</string>
     <key>CFBundleIdentifier</key>
-    <string>dev.luminos.app</string>
+    <string>dev.luminos.daemon</string>
     <key>CFBundleVersion</key>
     <string>1.0.0</string>
     <key>CFBundleShortVersionString</key>

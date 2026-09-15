@@ -10,9 +10,12 @@ Closes the gap where macOS only adjusts the built-in display's brightness.
   ambient-light sensor drive both displays — no Accessibility permission needed.
 - **Movie mode**: one-command hardware backlight boost for dark movies.
   Saves current DDC luminance/contrast, sets max; running it again restores.
+  The saved values are persisted to disk, so the monitor recovers even if the
+  app crashes, quits, or is redeployed while movie mode is on.
 - **Status bar item**: monitor icon in the menu bar with a **gamma slider**
-  (0.5–3.5) for the external display — lift shadow detail in dark scenes —
-  plus Reset Gamma, Sync toggle, Movie Mode toggle, and Quit.
+  (0.8–2.4, persisted) for the external display — lift shadow detail in dark
+  scenes — plus Sync toggle, Movie Mode toggle, and Quit.
+  The gamma is re-applied automatically after display sleep or replug.
 
 ## Usage
 
@@ -35,7 +38,9 @@ Log: `/tmp/luminos.log` (launchd stdout) and the unified log
 ```
 
 LaunchAgent: `~/Library/LaunchAgents/dev.luminos.daemon.plist`
-(starts at login, KeepAlive with 30 s throttle)
+(starts at login; restarts on crash only — `SuccessfulExit=false` — so the
+menu's Quit stays quit; 30 s throttle). `build.sh` installs/refreshes the
+plist on every deploy.
 
 ```sh
 launchctl kickstart -k gui/$(id -u)/dev.luminos.daemon   # restart
@@ -48,11 +53,13 @@ Tunables at the top of `Sources/luminos/main.swift`:
 
 | Constant | Default | Meaning |
 |---|---|---|
-| `DISPLAY_ARG` | `2` | m1ddc display index (`m1ddc display list`) |
-| `STEP` | `8` | DDC step for key mirroring (if tap enabled) |
 | `SYNC_MIN/MAX` | 10 / 100 | DDC range the built-in 0–100% maps onto |
 | `SYNC_HYSTERESIS` | `2` | min change before writing to the monitor |
 | `MOVIE_LUMINANCE/CONTRAST` | 100 / 85 | movie mode targets |
+| `GAMMA_MIN/MAX` | 0.8 / 2.4 | slider range (snaps at 1.0 / 1.3 / 1.6 / 2.2) |
+
+The m1ddc display index is auto-resolved at startup (and re-resolved on DDC
+failure) from `m1ddc display list` — no hardcoded index to maintain.
 
 ## Rebuilding
 
@@ -84,5 +91,7 @@ must be re-granted after each rebuild. A self-signed identity
   slider works regardless. Run `bin/luminos --test` to probe your display.
 - Sync has ~1–2 s latency by design (polling + hysteresis) to avoid spamming
   the monitor's I²C bus.
-- Gamma is a GPU color-table adjustment: it resets on display sleep, reconnect,
-  or reboot (re-apply via the slider), and conflicts with f.lux-style tools.
+- Gamma is a GPU color-table adjustment: it conflicts with f.lux-style tools.
+  Luminos persists the last value and re-applies it after display sleep or
+  replug, but a reboot's login is the one path where the first seconds may
+  show default gamma.
