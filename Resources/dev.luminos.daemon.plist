@@ -11,8 +11,13 @@
 	</array>
 	<key>RunAtLoad</key>
 	<true/>
+	<!-- restart only on abnormal exit; a clean quit (menu Quit / bootout with
+	     exit 0) must stay dead, otherwise "Quit" relaunches after 30 s -->
 	<key>KeepAlive</key>
-	<true/>
+	<dict>
+		<key>SuccessfulExit</key>
+		<false/>
+	</dict>
 	<key>ThrottleInterval</key>
 	<integer>30</integer>
 	<key>StandardOutPath</key>

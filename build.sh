@@ -36,8 +36,14 @@ mkdir -p "$INSTALL_DIR"
 rm -rf "$APP_PATH"
 cp -R ".build/$APP_NAME.app" "$APP_PATH"
 
+echo "▸ LaunchAgent"
 PLIST="$HOME/Library/LaunchAgents/$BUNDLE_ID.plist"
-# (no sed: the plist is static; an over-broad sed once mangled Label and log paths)
+mkdir -p "$(dirname "$PLIST")"
+cp "Resources/$BUNDLE_ID.plist" "$PLIST"
+# point ProgramArguments at this user's $HOME by replacing the whole array
+# via JSON (plutil -replace on a single array index inserts rather than
+# replaces; and no sed — an over-broad sed once mangled Label/log paths)
+plutil -replace ProgramArguments -json "[ \"$APP_PATH/Contents/MacOS/$APP_NAME\", \"--sync\" ]" "$PLIST"
 
 launchctl bootstrap "gui/$(id -u)" "$PLIST"
 sleep 2
